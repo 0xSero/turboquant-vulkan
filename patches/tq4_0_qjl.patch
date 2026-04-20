@@ -776,7 +776,7 @@ index d4bc87a1c..be52be51e 100644
  void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
  void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 15443aa55..ea9b505ce 100644
+index 15443aa55..8b393c491 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
 @@ -13,6 +13,13 @@
@@ -793,7 +793,7 @@ index 15443aa55..ea9b505ce 100644
  #define GROUP_MAX_EPS 1e-15f
  #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
  #define GROUP_MAX_EPS_IQ2_S 1e-8f
-@@ -2349,6 +2356,580 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+@@ -2349,6 +2356,583 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
      return nrow * row_size;
  }
  
@@ -1241,10 +1241,13 @@ index 15443aa55..ea9b505ce 100644
 +}
 +
 +static inline uint8_t tq4_quantize_scalar(float v) {
-+    // Linear scan through 15 boundaries → 4-bit index
-+    int idx = 0;
-+    while (idx < 15 && v > tq4_boundaries[idx]) idx++;
-+    return (uint8_t)idx;
++    // Count boundaries strictly below v → 4-bit index in [0, 15].
++    // Branchless so compiler can SIMD-ify a loop of 8+ values.
++    uint8_t idx = 0;
++    for (int k = 0; k < 15; ++k) {
++        idx += (v > tq4_boundaries[k]);
++    }
++    return idx;
 +}
 +
 +void quantize_row_tq4_0_ref(const float * GGML_RESTRICT x, block_tq4_0 * GGML_RESTRICT y, int64_t k) {
