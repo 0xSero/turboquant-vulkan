@@ -60,10 +60,10 @@ index 2b3eb5b5c..362890719 100644
          .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
      },
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index f66127c22..42e7e4c45 100644
+index f66127c22..df902bc08 100644
 --- a/ggml/src/ggml-cpu/quants.c
 +++ b/ggml/src/ggml-cpu/quants.c
-@@ -112,6 +112,253 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
+@@ -112,6 +112,411 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
      quantize_row_tq2_0_ref(x, y, k);
  }
  
@@ -101,6 +101,9 @@ index f66127c22..42e7e4c45 100644
 +#if defined(__ARM_NEON)
 +#include <arm_neon.h>
 +#endif
++#if defined(__AVX2__)
++#include <immintrin.h>
++#endif
 +
 +void ggml_vec_dot_tq3_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
 +    assert(nrc == 1);
@@ -110,7 +113,162 @@ index f66127c22..42e7e4c45 100644
 +    const block_q8_0  * GGML_RESTRICT y = vy;
 +    const int nb = n / QK_TQ3_0;
 +
-+#if defined(__ARM_NEON)
++#if defined(__AVX2__) && 0  // disabled: WIP AVX2 path had a butterfly sign bug; falls through to scalar
++    // Same math identity as NEON path:
++    //   dot(dequant(q), y*d8) = inv_sqrt_32 * d * d8 * dot(centroids, butterfly(signs·y))
++    // Butterfly runs on q8 side (int8 sign-mul → widen to float → 5-stage butterfly).
++    // Centroid side is just a scalar lookup per value + float FMA.
++    static const int8_t tq3_signs_i8[32] __attribute__((aligned(32))) = {
++        1,-1, 1, 1,-1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,
++        1,-1,-1, 1, 1,-1, 1,-1,-1, 1, 1, 1,-1,-1, 1,-1
++    };
++
++    __m256 acc = _mm256_setzero_ps();
++    const __m256i sg = _mm256_load_si256((const __m256i *)tq3_signs_i8);
++
++    for (int i = 0; i < nb; ++i) {
++        const float d  = GGML_CPU_FP16_TO_FP32(x[i].d);
++        const float d8 = GGML_CPU_FP16_TO_FP32(y[i].d);
++
++        // Load q8 (32 int8s), multiply by signs
++        const __m256i y_i8 = _mm256_loadu_si256((const __m256i *)y[i].qs);
++        const __m256i sy_i8 = _mm256_sign_epi8(y_i8, sg);
++
++        // Widen to int16 halves, then to int32, then to float32
++        // Low 16 bytes → int16 x 16
++        const __m256i sy_lo_i16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(sy_i8));
++        const __m256i sy_hi_i16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(sy_i8, 1));
++
++        // Each half: 16 int16s → split into 4x __m256 of 8 floats
++        // Lower 8 int16s of sy_lo
++        __m256 a0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(sy_lo_i16)));
++        __m256 a1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(sy_lo_i16, 1)));
++        __m256 a2 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(sy_hi_i16)));
++        __m256 a3 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(sy_hi_i16, 1)));
++        // a0..a3 each hold 8 floats; together 32 values = full block
++
++        // WHT butterfly on 32 floats (5 stages)
++        // Stage 1 (step=1): within each 8-lane vec, pairs of (even,odd) → (e+o, e-o)
++        // Stage 2 (step=2): within each 8-lane vec, pairs of 2 (lo2+hi2, lo2-hi2)
++        // Stage 3 (step=4): within each 8-lane vec, lo4+hi4, lo4-hi4
++        // Stage 4 (step=8): between vectors (a0+a1, a2+a3, a0-a1, a2-a3)
++        // Stage 5 (step=16): between pairs of vectors
++
++        // Stage 1 (step=1): pairs (even,odd) → (e+o, e-o)
++        // For even lanes: want v[even] + v[odd]. For odd lanes: want v[even] - v[odd].
++        // v-perm at even lane = v[even]-v[odd] (wrong, we want +)
++        // v-perm at odd lane  = v[odd]-v[even] (wrong, we want v[even]-v[odd])
++        // So: at even lanes use add; at odd lanes use perm-v (= v[even]-v[odd]).
++        #define WHT_ST1(v) { \
++            __m256 perm = _mm256_permute_ps(v, 0xB1); \
++            __m256 add_ = _mm256_add_ps(v, perm);     /* even lanes: a+b */ \
++            __m256 sub_ = _mm256_sub_ps(perm, v);     /* odd lanes: a-b (perm=a, v=b at odd) */ \
++            v = _mm256_blend_ps(add_, sub_, 0xAA); \
++        }
++        WHT_ST1(a0); WHT_ST1(a1); WHT_ST1(a2); WHT_ST1(a3);
++        #undef WHT_ST1
++
++        // Stage 2 (step=2): pairs of 2 elements, same sign logic
++        // v at lanes 0,1 = (a,b); lanes 2,3 = (c,d). Want (a+c, b+d, a-c, b-d).
++        // swp shuffles to (c,d,a,b,g,h,e,f). At lanes 0,1: add. At lanes 2,3: swp-v = a-c, b-d.
++        #define WHT_ST2(v) { \
++            __m256 swp = _mm256_permute_ps(v, 0x4E); \
++            __m256 add_ = _mm256_add_ps(v, swp); \
++            __m256 sub_ = _mm256_sub_ps(swp, v); \
++            v = _mm256_blend_ps(add_, sub_, 0xCC); \
++        }
++        WHT_ST2(a0); WHT_ST2(a1); WHT_ST2(a2); WHT_ST2(a3);
++        #undef WHT_ST2
++
++        // Stage 3 (step=4): lo4 ± hi4 within each 8-lane vec
++        // v = [lo4|hi4], swp = [hi4|lo4]. Lanes 0-3: want lo+hi (= v+swp). Lanes 4-7: want lo-hi (= swp-v at those lanes gives hi-lo which is wrong).
++        // Lanes 4-7: want lo-hi; swp[4..7]=lo, v[4..7]=hi, so swp-v = lo-hi ✓
++        #define WHT_ST3(v) { \
++            __m256 swp = _mm256_permute2f128_ps(v, v, 0x01); \
++            __m256 add_ = _mm256_add_ps(v, swp); \
++            __m256 sub_ = _mm256_sub_ps(swp, v); \
++            v = _mm256_blend_ps(add_, sub_, 0xF0); \
++        }
++        WHT_ST3(a0); WHT_ST3(a1); WHT_ST3(a2); WHT_ST3(a3);
++        #undef WHT_ST3
++
++        // Stage 4 (step=8): pair (a0,a1) — positions [0..7] with [8..15]; (a2,a3) with [16..23] [24..31]
++        __m256 b0 = _mm256_add_ps(a0, a1); // positions 0..7
++        __m256 b1 = _mm256_sub_ps(a0, a1); // positions 8..15
++        __m256 b2 = _mm256_add_ps(a2, a3); // positions 16..23
++        __m256 b3 = _mm256_sub_ps(a2, a3); // positions 24..31
++
++        // Stage 5 (step=16): pair (b0,b2) and (b1,b3)
++        __m256 yb0 = _mm256_add_ps(b0, b2); // positions 0..7
++        __m256 yb1 = _mm256_add_ps(b1, b3); // positions 8..15
++        __m256 yb2 = _mm256_sub_ps(b0, b2); // positions 16..23
++        __m256 yb3 = _mm256_sub_ps(b1, b3); // positions 24..31
++
++        // Unpack centroids (no scale; d folds into final)
++        const uint8_t * qs = x[i].qs;
++        uint32_t w0, w1, w2;
++        memcpy(&w0, qs + 0, 4);
++        memcpy(&w1, qs + 4, 4);
++        memcpy(&w2, qs + 8, 4);
++
++        float r[32];
++        r[0]  = tq3_centroids_dot[ w0        & 7];
++        r[1]  = tq3_centroids_dot[(w0 >>  3) & 7];
++        r[2]  = tq3_centroids_dot[(w0 >>  6) & 7];
++        r[3]  = tq3_centroids_dot[(w0 >>  9) & 7];
++        r[4]  = tq3_centroids_dot[(w0 >> 12) & 7];
++        r[5]  = tq3_centroids_dot[(w0 >> 15) & 7];
++        r[6]  = tq3_centroids_dot[(w0 >> 18) & 7];
++        r[7]  = tq3_centroids_dot[(w0 >> 21) & 7];
++        r[8]  = tq3_centroids_dot[(w0 >> 24) & 7];
++        r[9]  = tq3_centroids_dot[(w0 >> 27) & 7];
++        r[10] = tq3_centroids_dot[((w0 >> 30) | ((w1 & 1) << 2)) & 7];
++        r[11] = tq3_centroids_dot[(w1 >>  1) & 7];
++        r[12] = tq3_centroids_dot[(w1 >>  4) & 7];
++        r[13] = tq3_centroids_dot[(w1 >>  7) & 7];
++        r[14] = tq3_centroids_dot[(w1 >> 10) & 7];
++        r[15] = tq3_centroids_dot[(w1 >> 13) & 7];
++        r[16] = tq3_centroids_dot[(w1 >> 16) & 7];
++        r[17] = tq3_centroids_dot[(w1 >> 19) & 7];
++        r[18] = tq3_centroids_dot[(w1 >> 22) & 7];
++        r[19] = tq3_centroids_dot[(w1 >> 25) & 7];
++        r[20] = tq3_centroids_dot[(w1 >> 28) & 7];
++        r[21] = tq3_centroids_dot[((w1 >> 31) | ((w2 & 3) << 1)) & 7];
++        r[22] = tq3_centroids_dot[(w2 >>  2) & 7];
++        r[23] = tq3_centroids_dot[(w2 >>  5) & 7];
++        r[24] = tq3_centroids_dot[(w2 >>  8) & 7];
++        r[25] = tq3_centroids_dot[(w2 >> 11) & 7];
++        r[26] = tq3_centroids_dot[(w2 >> 14) & 7];
++        r[27] = tq3_centroids_dot[(w2 >> 17) & 7];
++        r[28] = tq3_centroids_dot[(w2 >> 20) & 7];
++        r[29] = tq3_centroids_dot[(w2 >> 23) & 7];
++        r[30] = tq3_centroids_dot[(w2 >> 26) & 7];
++        r[31] = tq3_centroids_dot[(w2 >> 29) & 7];
++
++        __m256 cv0 = _mm256_loadu_ps(r +  0);
++        __m256 cv1 = _mm256_loadu_ps(r +  8);
++        __m256 cv2 = _mm256_loadu_ps(r + 16);
++        __m256 cv3 = _mm256_loadu_ps(r + 24);
++
++        const float scale = 0.17677669529663688f * d * d8;
++        const __m256 scv = _mm256_set1_ps(scale);
++
++        __m256 dot0 = _mm256_mul_ps(cv0, yb0);
++        dot0 = _mm256_fmadd_ps(cv1, yb1, dot0);
++        dot0 = _mm256_fmadd_ps(cv2, yb2, dot0);
++        dot0 = _mm256_fmadd_ps(cv3, yb3, dot0);
++
++        acc = _mm256_fmadd_ps(dot0, scv, acc);
++    }
++
++    // Horizontal sum of acc
++    __m128 acc_hi = _mm256_extractf128_ps(acc, 1);
++    __m128 acc_lo = _mm256_castps256_ps128(acc);
++    __m128 sum128 = _mm_add_ps(acc_lo, acc_hi);
++    sum128 = _mm_hadd_ps(sum128, sum128);
++    sum128 = _mm_hadd_ps(sum128, sum128);
++    *s = _mm_cvtss_f32(sum128);
++#elif defined(__ARM_NEON)
 +    // Key math identity: dot(dequant(q), y*d8)
 +    //   = inv_sqrt_32 * d * d8 * dot(signs · butterfly(centroids), y)
 +    //   = inv_sqrt_32 * d * d8 * dot(centroids, butterfly(signs · y))
@@ -331,7 +489,7 @@ index d4bc87a1c..4a12cdca6 100644
  void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
  void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 15443aa55..71674294e 100644
+index 15443aa55..db7ca47b1 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
 @@ -13,6 +13,10 @@
@@ -345,7 +503,7 @@ index 15443aa55..71674294e 100644
  #define GROUP_MAX_EPS 1e-15f
  #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
  #define GROUP_MAX_EPS_IQ2_S 1e-8f
-@@ -2349,6 +2353,262 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+@@ -2349,6 +2353,300 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
      return nrow * row_size;
  }
  
@@ -398,30 +556,64 @@ index 15443aa55..71674294e 100644
 +    assert(k % QK_TQ3_0 == 0);
 +    const int64_t nb = k / QK_TQ3_0;
 +
++    // Rotate all blocks first (WHT per block; signs applied locally).
++    // Then compute ONE L2 norm across the whole row — aligning with TurboQuant's
++    // per-vector normalization (Zandieh et al. 2025, arXiv 2504.19874).
++    // This replaces per-block RMS scaling which amplified inter-block
++    // quantization drift in attention K/Q dot products.
++    //
++    // Memory: one float[nb][32] buffer on the stack cap by nb≤32 (row ≤ 1024 floats).
++    // For larger rows we chunk.
++    #define TQ3_MAX_BLOCKS_PER_ROW 32
++    if (nb > TQ3_MAX_BLOCKS_PER_ROW) {
++        // Fall back to per-block scale for very large rows (>1024 elements).
++        // Should never happen in practice for KV cache head_dim ≤ 256.
++        for (int64_t i = 0; i < nb; ++i) {
++            float rotated[QK_TQ3_0];
++            for (int j = 0; j < QK_TQ3_0; ++j) rotated[j] = x[i*QK_TQ3_0 + j];
++            tq3_wht32(rotated, false);
++            float sumsq = 0.0f;
++            for (int j = 0; j < QK_TQ3_0; ++j) sumsq += rotated[j] * rotated[j];
++            float d = sqrtf(sumsq / QK_TQ3_0) / tq3_centroid_rms;
++            if (d <= 0.0f) d = 1e-8f;
++            y[i].d = GGML_FP32_TO_FP16(d);
++            memset(y[i].qs, 0, sizeof(y[i].qs));
++            const float id = 1.0f / d;
++            for (int j = 0; j < QK_TQ3_0; ++j) {
++                const uint8_t idx = tq3_quantize_scalar(rotated[j] * id);
++                const int bit = j * 3; const int byte = bit / 8; const int shift = bit % 8;
++                y[i].qs[byte] |= idx << shift;
++                if (shift > 5) y[i].qs[byte + 1] |= idx >> (8 - shift);
++            }
++        }
++        return;
++    }
++
++    float rotated[TQ3_MAX_BLOCKS_PER_ROW][QK_TQ3_0];
++    float row_sumsq = 0.0f;
++
 +    for (int64_t i = 0; i < nb; ++i) {
-+        float rotated[QK_TQ3_0];
 +        for (int j = 0; j < QK_TQ3_0; ++j) {
-+            rotated[j] = x[i*QK_TQ3_0 + j];
++            rotated[i][j] = x[i*QK_TQ3_0 + j];
 +        }
-+
-+        tq3_wht32(rotated, false);
-+
-+        float sumsq = 0.0f;
++        tq3_wht32(rotated[i], false);
 +        for (int j = 0; j < QK_TQ3_0; ++j) {
-+            sumsq += rotated[j] * rotated[j];
++            row_sumsq += rotated[i][j] * rotated[i][j];
 +        }
++    }
 +
-+        float d = sqrtf(sumsq / QK_TQ3_0) / tq3_centroid_rms;
-+        if (d <= 0.0f) {
-+            d = 1e-8f;
-+        }
++    // Per-row scale: same centroid-compatible magnitude as before,
++    // but computed over all nb*32 values instead of just 32.
++    float d = sqrtf(row_sumsq / (nb * QK_TQ3_0)) / tq3_centroid_rms;
++    if (d <= 0.0f) d = 1e-8f;
++    const float id = 1.0f / d;
++    const ggml_half dh = GGML_FP32_TO_FP16(d);
 +
-+        y[i].d = GGML_FP32_TO_FP16(d);
++    for (int64_t i = 0; i < nb; ++i) {
++        y[i].d = dh;
 +        memset(y[i].qs, 0, sizeof(y[i].qs));
-+
-+        const float id = 1.0f / d;
 +        for (int j = 0; j < QK_TQ3_0; ++j) {
-+            const uint8_t idx = tq3_quantize_scalar(rotated[j] * id);
++            const uint8_t idx = tq3_quantize_scalar(rotated[i][j] * id);
 +            const int bit = j * 3;
 +            const int byte = bit / 8;
 +            const int shift = bit % 8;
@@ -431,12 +623,16 @@ index 15443aa55..71674294e 100644
 +            }
 +        }
 +    }
++    #undef TQ3_MAX_BLOCKS_PER_ROW
 +}
 +
 +size_t quantize_tq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
 +    (void)quant_weights;
 +    const size_t row_size = ggml_row_size(GGML_TYPE_TQ3_0, n_per_row);
-+    quantize_row_tq3_0_ref(src, dst, (int64_t)nrow*n_per_row);
++    char * d = (char *)dst;
++    for (int64_t r = 0; r < nrow; ++r) {
++        quantize_row_tq3_0_ref(src + r * n_per_row, (block_tq3_0 *)(d + r * row_size), n_per_row);
++    }
 +    return nrow * row_size;
 +}
 +
