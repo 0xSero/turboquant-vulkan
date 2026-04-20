@@ -80,10 +80,10 @@ index 2b3eb5b5c..d9c45b4ea 100644
          .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
      },
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index f66127c22..6c9602135 100644
+index f66127c22..a2a5143e4 100644
 --- a/ggml/src/ggml-cpu/quants.c
 +++ b/ggml/src/ggml-cpu/quants.c
-@@ -112,6 +112,659 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
+@@ -112,6 +112,675 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
      quantize_row_tq2_0_ref(x, y, k);
  }
  
@@ -637,19 +637,35 @@ index f66127c22..6c9602135 100644
 +    -1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1, 1
 +};
 +
-+static inline void tq4_dot_wht32(float * x, const float * signs, bool inverse) {
++static inline void tq4_dot_wht32(float * GGML_RESTRICT x, const float * GGML_RESTRICT signs, bool inverse) {
 +    if (!inverse) {
 +        for (int i = 0; i < 32; ++i) x[i] *= signs[i];
 +    }
-+    for (int step = 1; step < 32; step <<= 1) {
-+        for (int i = 0; i < 32; i += step * 2) {
-+            for (int j = i; j < i + step; ++j) {
-+                const float a = x[j];
-+                const float b = x[j + step];
-+                x[j] = a + b;
-+                x[j + step] = a - b;
-+            }
++    for (int i = 0; i < 32; i += 2) {
++        const float a = x[i], b = x[i+1];
++        x[i] = a + b; x[i+1] = a - b;
++    }
++    for (int i = 0; i < 32; i += 4) {
++        const float a0 = x[i], b0 = x[i+2];
++        const float a1 = x[i+1], b1 = x[i+3];
++        x[i] = a0 + b0; x[i+2] = a0 - b0;
++        x[i+1] = a1 + b1; x[i+3] = a1 - b1;
++    }
++    for (int i = 0; i < 32; i += 8) {
++        for (int j = 0; j < 4; ++j) {
++            const float a = x[i+j], b = x[i+j+4];
++            x[i+j] = a + b; x[i+j+4] = a - b;
 +        }
++    }
++    for (int i = 0; i < 32; i += 16) {
++        for (int j = 0; j < 8; ++j) {
++            const float a = x[i+j], b = x[i+j+8];
++            x[i+j] = a + b; x[i+j+8] = a - b;
++        }
++    }
++    for (int j = 0; j < 16; ++j) {
++        const float a = x[j], b = x[j+16];
++        x[j] = a + b; x[j+16] = a - b;
 +    }
 +    const float scale = 0.17677669529663688f;
 +    for (int i = 0; i < 32; ++i) x[i] *= scale;
@@ -760,7 +776,7 @@ index d4bc87a1c..be52be51e 100644
  void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
  void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 15443aa55..97e339652 100644
+index 15443aa55..ea9b505ce 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
 @@ -13,6 +13,13 @@
@@ -777,7 +793,7 @@ index 15443aa55..97e339652 100644
  #define GROUP_MAX_EPS 1e-15f
  #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
  #define GROUP_MAX_EPS_IQ2_S 1e-8f
-@@ -2349,6 +2356,556 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+@@ -2349,6 +2356,580 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
      return nrow * row_size;
  }
  
@@ -1178,22 +1194,46 @@ index 15443aa55..97e339652 100644
 +};
 +static const float tq4_centroid_rms = 1.3400f; // sqrt of centroid variance weighted by Gaussian PMF
 +
-+// Same Hadamard structure as tq3_wht32 but with configurable sign array.
-+static inline void tq4_wht32(float * x, const float * signs, bool inverse) {
++// Hadamard-Walsh transform on 32 floats with configurable sign pattern.
++// Forward: signs applied first, then butterfly (5 stages), then scale by 1/√32.
++// Inverse: butterfly (self-inverse), then scale, then signs.
++// Fully unrolled — compiler vectorizes butterfly stages cleanly.
++static inline void tq4_wht32(float * GGML_RESTRICT x, const float * GGML_RESTRICT signs, bool inverse) {
 +    if (!inverse) {
 +        for (int i = 0; i < 32; ++i) x[i] *= signs[i];
 +    }
-+    for (int step = 1; step < 32; step <<= 1) {
-+        for (int i = 0; i < 32; i += step * 2) {
-+            for (int j = i; j < i + step; ++j) {
-+                const float a = x[j];
-+                const float b = x[j + step];
-+                x[j] = a + b;
-+                x[j + step] = a - b;
-+            }
++    // Stage 1 (step=1): 16 butterflies on adjacent pairs
++    for (int i = 0; i < 32; i += 2) {
++        const float a = x[i], b = x[i+1];
++        x[i] = a + b; x[i+1] = a - b;
++    }
++    // Stage 2 (step=2): 8 butterflies on stride-2 pairs within groups of 4
++    for (int i = 0; i < 32; i += 4) {
++        const float a0 = x[i], b0 = x[i+2];
++        const float a1 = x[i+1], b1 = x[i+3];
++        x[i] = a0 + b0; x[i+2] = a0 - b0;
++        x[i+1] = a1 + b1; x[i+3] = a1 - b1;
++    }
++    // Stage 3 (step=4): within groups of 8
++    for (int i = 0; i < 32; i += 8) {
++        for (int j = 0; j < 4; ++j) {
++            const float a = x[i+j], b = x[i+j+4];
++            x[i+j] = a + b; x[i+j+4] = a - b;
 +        }
 +    }
-+    const float scale = 0.17677669529663688f; // 1/sqrt(32)
++    // Stage 4 (step=8): within groups of 16 — pure 8-wide SIMD friendly
++    for (int i = 0; i < 32; i += 16) {
++        for (int j = 0; j < 8; ++j) {
++            const float a = x[i+j], b = x[i+j+8];
++            x[i+j] = a + b; x[i+j+8] = a - b;
++        }
++    }
++    // Stage 5 (step=16): single SIMD-wide pass across halves
++    for (int j = 0; j < 16; ++j) {
++        const float a = x[j], b = x[j+16];
++        x[j] = a + b; x[j+16] = a - b;
++    }
++    const float scale = 0.17677669529663688f;
 +    for (int i = 0; i < 32; ++i) x[i] *= scale;
 +    if (inverse) {
 +        for (int i = 0; i < 32; ++i) x[i] *= signs[i];
