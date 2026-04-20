@@ -38,12 +38,15 @@ property of QJL kicking in, exactly as the paper proves.
 | K cache | V cache | pp512 | tg128 | tg vs f16 |
 |---------|---------|-------|-------|-----------|
 | f16     | f16     | 312   | 27.29 | 100%      |
+| q8_0    | q8_0    | 304   | 27.06 | 99.2% (native AVX2 reference) |
 | tq3_0   | tq3_0   | 165   | 26.41 | 96.8%     |
-| tq4_0   | tq4_0   | 153   | 26.35 | **96.6%** |
+| **tq4_0** | **tq4_0** | **153** | **26.91** | **98.6%** |
 | tq3_0   | f16     | 225   | 26.88 | 98.5%     |
 | tq4_0   | f16     | 199   | 26.91 | 98.6%     |
 
-TQ4_0 matches TQ3_0 on decode speed (±0.2 pp) while delivering 8× lower PPL gap.
+**TQ4_0 beats TQ3_0 on decode speed** after branchless Lloyd-Max + unrolled WHT,
+while delivering ~10× better dot-product accuracy. Prefill (pp512) is still ~50%
+of f16 because dequant is more arithmetic than q8_0's simple scale.
 
 ## Algorithm
 
