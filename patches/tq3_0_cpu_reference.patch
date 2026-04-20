@@ -60,10 +60,10 @@ index 2b3eb5b5c..362890719 100644
          .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
      },
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index f66127c22..026f14de1 100644
+index f66127c22..42e7e4c45 100644
 --- a/ggml/src/ggml-cpu/quants.c
 +++ b/ggml/src/ggml-cpu/quants.c
-@@ -112,6 +112,75 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
+@@ -112,6 +112,253 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
      quantize_row_tq2_0_ref(x, y, k);
  }
  
@@ -86,6 +86,22 @@ index f66127c22..026f14de1 100644
 +static const float tq3_centroids_dot[8] = {-2.1519f, -1.3439f, -0.7560f, -0.2451f, 0.2451f, 0.7560f, 1.3439f, 2.1519f};
 +static const float tq3_signs_dot[32] = {1,-1,1,1,-1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,1,-1,-1,1,1,-1,1,-1,-1,1,1,1,-1,-1,1,-1};
 +
++// Precomputed: signs * inv_sqrt_32 so we can fold into one multiply in the dot
++static const float tq3_signs_scaled[32] = {
++     0.17677669529663688f, -0.17677669529663688f,  0.17677669529663688f,  0.17677669529663688f,
++    -0.17677669529663688f, -0.17677669529663688f,  0.17677669529663688f, -0.17677669529663688f,
++     0.17677669529663688f,  0.17677669529663688f, -0.17677669529663688f,  0.17677669529663688f,
++    -0.17677669529663688f,  0.17677669529663688f, -0.17677669529663688f, -0.17677669529663688f,
++     0.17677669529663688f, -0.17677669529663688f, -0.17677669529663688f,  0.17677669529663688f,
++     0.17677669529663688f, -0.17677669529663688f,  0.17677669529663688f, -0.17677669529663688f,
++    -0.17677669529663688f,  0.17677669529663688f,  0.17677669529663688f,  0.17677669529663688f,
++    -0.17677669529663688f, -0.17677669529663688f,  0.17677669529663688f, -0.17677669529663688f
++};
++
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
++
 +void ggml_vec_dot_tq3_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
 +    assert(nrc == 1);
 +    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
@@ -94,12 +110,175 @@ index f66127c22..026f14de1 100644
 +    const block_q8_0  * GGML_RESTRICT y = vy;
 +    const int nb = n / QK_TQ3_0;
 +
++#if defined(__ARM_NEON)
++    // Key math identity: dot(dequant(q), y*d8)
++    //   = inv_sqrt_32 * d * d8 * dot(signs · butterfly(centroids), y)
++    //   = inv_sqrt_32 * d * d8 * dot(centroids, butterfly(signs · y))
++    // → butterfly runs on the q8 side (once per block), centroids just get
++    // multiplied and summed. No butterfly on floats per dot.
++
++    float32x4_t acc = vdupq_n_f32(0.0f);
++
++    // Preload signs as int8 vectors for the preconditioning
++    static const int8_t tq3_signs_i8[32] = {
++        1,-1, 1, 1,-1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,
++        1,-1,-1, 1, 1,-1, 1,-1,-1, 1, 1, 1,-1,-1, 1,-1
++    };
++    int8x16_t sg0 = vld1q_s8(tq3_signs_i8 + 0);
++    int8x16_t sg1 = vld1q_s8(tq3_signs_i8 + 16);
++
++    for (int i = 0; i < nb; ++i) {
++        const float d  = GGML_CPU_FP16_TO_FP32(x[i].d);
++        const float d8 = GGML_CPU_FP16_TO_FP32(y[i].d);
++
++        // --- Step 1: load q8 and apply signs (int8 mul, cheap) ---
++        const int8_t * yq = y[i].qs;
++        int8x16_t y0i = vld1q_s8(yq + 0);
++        int8x16_t y1i = vld1q_s8(yq + 16);
++        int8x16_t sy0 = vmulq_s8(y0i, sg0);
++        int8x16_t sy1 = vmulq_s8(y1i, sg1);
++
++        // Widen to int32 then float for butterfly
++        int16x8_t sy0_lo = vmovl_s8(vget_low_s8(sy0));
++        int16x8_t sy0_hi = vmovl_s8(vget_high_s8(sy0));
++        int16x8_t sy1_lo = vmovl_s8(vget_low_s8(sy1));
++        int16x8_t sy1_hi = vmovl_s8(vget_high_s8(sy1));
++
++        float32x4_t a0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16 (sy0_lo)));
++        float32x4_t a1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(sy0_lo)));
++        float32x4_t a2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16 (sy0_hi)));
++        float32x4_t a3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(sy0_hi)));
++        float32x4_t a4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16 (sy1_lo)));
++        float32x4_t a5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(sy1_lo)));
++        float32x4_t a6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16 (sy1_hi)));
++        float32x4_t a7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(sy1_hi)));
++
++        // --- Step 2: WHT butterfly on signed-q8 (float) ---
++        #define WHT_STAGE1(va) { \
++            float32x4x2_t t = vuzpq_f32(va, va); \
++            float32x4_t e = t.val[0]; \
++            float32x4_t o = t.val[1]; \
++            float32x4_t sum = vaddq_f32(e, o); \
++            float32x4_t dif = vsubq_f32(e, o); \
++            float32x4x2_t zp = vzipq_f32(sum, dif); \
++            va = zp.val[0]; \
++        }
++        WHT_STAGE1(a0); WHT_STAGE1(a1); WHT_STAGE1(a2); WHT_STAGE1(a3);
++        WHT_STAGE1(a4); WHT_STAGE1(a5); WHT_STAGE1(a6); WHT_STAGE1(a7);
++        #undef WHT_STAGE1
++
++        #define WHT_STAGE2(va) { \
++            float32x2_t lo = vget_low_f32(va); \
++            float32x2_t hi = vget_high_f32(va); \
++            float32x2_t s2 = vadd_f32(lo, hi); \
++            float32x2_t d2 = vsub_f32(lo, hi); \
++            va = vcombine_f32(s2, d2); \
++        }
++        WHT_STAGE2(a0); WHT_STAGE2(a1); WHT_STAGE2(a2); WHT_STAGE2(a3);
++        WHT_STAGE2(a4); WHT_STAGE2(a5); WHT_STAGE2(a6); WHT_STAGE2(a7);
++        #undef WHT_STAGE2
++
++        float32x4_t b0 = vaddq_f32(a0, a1);
++        float32x4_t b1 = vaddq_f32(a2, a3);
++        float32x4_t b2 = vaddq_f32(a4, a5);
++        float32x4_t b3 = vaddq_f32(a6, a7);
++        float32x4_t b4 = vsubq_f32(a0, a1);
++        float32x4_t b5 = vsubq_f32(a2, a3);
++        float32x4_t b6 = vsubq_f32(a4, a5);
++        float32x4_t b7 = vsubq_f32(a6, a7);
++
++        float32x4_t c0 = vaddq_f32(b0, b1);
++        float32x4_t c1 = vaddq_f32(b2, b3);
++        float32x4_t c2 = vaddq_f32(b4, b5);
++        float32x4_t c3 = vaddq_f32(b6, b7);
++        float32x4_t c4 = vsubq_f32(b0, b1);
++        float32x4_t c5 = vsubq_f32(b2, b3);
++        float32x4_t c6 = vsubq_f32(b4, b5);
++        float32x4_t c7 = vsubq_f32(b6, b7);
++
++        float32x4_t yb0 = vaddq_f32(c0, c1);
++        float32x4_t yb1 = vaddq_f32(c2, c3);
++        float32x4_t yb2 = vaddq_f32(c4, c5);
++        float32x4_t yb3 = vaddq_f32(c6, c7);
++        float32x4_t yb4 = vsubq_f32(c0, c1);
++        float32x4_t yb5 = vsubq_f32(c2, c3);
++        float32x4_t yb6 = vsubq_f32(c4, c5);
++        float32x4_t yb7 = vsubq_f32(c6, c7);
++
++        // --- Step 3: unpack centroids (no scale — fold d into final) ---
++        const uint8_t * qs = x[i].qs;
++        uint32_t w0, w1, w2;
++        memcpy(&w0, qs + 0, 4);
++        memcpy(&w1, qs + 4, 4);
++        memcpy(&w2, qs + 8, 4);
++
++        float r[32];
++        r[0] = tq3_centroids_dot[ w0        & 7];
++        r[1] = tq3_centroids_dot[(w0 >>  3) & 7];
++        r[2] = tq3_centroids_dot[(w0 >>  6) & 7];
++        r[3] = tq3_centroids_dot[(w0 >>  9) & 7];
++        r[4] = tq3_centroids_dot[(w0 >> 12) & 7];
++        r[5] = tq3_centroids_dot[(w0 >> 15) & 7];
++        r[6] = tq3_centroids_dot[(w0 >> 18) & 7];
++        r[7] = tq3_centroids_dot[(w0 >> 21) & 7];
++        r[8] = tq3_centroids_dot[(w0 >> 24) & 7];
++        r[9] = tq3_centroids_dot[(w0 >> 27) & 7];
++        r[10] = tq3_centroids_dot[((w0 >> 30) | ((w1 & 1) << 2)) & 7];
++        r[11] = tq3_centroids_dot[(w1 >>  1) & 7];
++        r[12] = tq3_centroids_dot[(w1 >>  4) & 7];
++        r[13] = tq3_centroids_dot[(w1 >>  7) & 7];
++        r[14] = tq3_centroids_dot[(w1 >> 10) & 7];
++        r[15] = tq3_centroids_dot[(w1 >> 13) & 7];
++        r[16] = tq3_centroids_dot[(w1 >> 16) & 7];
++        r[17] = tq3_centroids_dot[(w1 >> 19) & 7];
++        r[18] = tq3_centroids_dot[(w1 >> 22) & 7];
++        r[19] = tq3_centroids_dot[(w1 >> 25) & 7];
++        r[20] = tq3_centroids_dot[(w1 >> 28) & 7];
++        r[21] = tq3_centroids_dot[((w1 >> 31) | ((w2 & 3) << 1)) & 7];
++        r[22] = tq3_centroids_dot[(w2 >>  2) & 7];
++        r[23] = tq3_centroids_dot[(w2 >>  5) & 7];
++        r[24] = tq3_centroids_dot[(w2 >>  8) & 7];
++        r[25] = tq3_centroids_dot[(w2 >> 11) & 7];
++        r[26] = tq3_centroids_dot[(w2 >> 14) & 7];
++        r[27] = tq3_centroids_dot[(w2 >> 17) & 7];
++        r[28] = tq3_centroids_dot[(w2 >> 20) & 7];
++        r[29] = tq3_centroids_dot[(w2 >> 23) & 7];
++        r[30] = tq3_centroids_dot[(w2 >> 26) & 7];
++        r[31] = tq3_centroids_dot[(w2 >> 29) & 7];
++
++        float32x4_t cv0 = vld1q_f32(r +  0);
++        float32x4_t cv1 = vld1q_f32(r +  4);
++        float32x4_t cv2 = vld1q_f32(r +  8);
++        float32x4_t cv3 = vld1q_f32(r + 12);
++        float32x4_t cv4 = vld1q_f32(r + 16);
++        float32x4_t cv5 = vld1q_f32(r + 20);
++        float32x4_t cv6 = vld1q_f32(r + 24);
++        float32x4_t cv7 = vld1q_f32(r + 28);
++
++        // --- Step 4: dot(centroids, WHT(signs·y)) into acc ---
++        // All scaling (inv_sqrt_32 * d * d8) folded into one final multiply
++        const float scale = 0.17677669529663688f * d * d8;
++        float32x4_t scv = vdupq_n_f32(scale);
++
++        float32x4_t dot0 = vmulq_f32(cv0, yb0);
++        float32x4_t dot1 = vfmaq_f32(dot0, cv1, yb1);
++        float32x4_t dot2 = vfmaq_f32(dot1, cv2, yb2);
++        float32x4_t dot3 = vfmaq_f32(dot2, cv3, yb3);
++        float32x4_t dot4 = vfmaq_f32(dot3, cv4, yb4);
++        float32x4_t dot5 = vfmaq_f32(dot4, cv5, yb5);
++        float32x4_t dot6 = vfmaq_f32(dot5, cv6, yb6);
++        float32x4_t dot7 = vfmaq_f32(dot6, cv7, yb7);
++
++        acc = vfmaq_f32(acc, dot7, scv);
++    }
++
++    *s = vaddvq_f32(acc);
++#else
 +    float sumf = 0.0f;
 +    for (int i = 0; i < nb; ++i) {
 +        const float d  = GGML_CPU_FP16_TO_FP32(x[i].d);
 +        const float d8 = GGML_CPU_FP16_TO_FP32(y[i].d);
 +
-+        // Unpack 3-bit indices → scaled centroids
 +        float rotated[32];
 +        const uint8_t * qs = x[i].qs;
 +        for (int j = 0; j < 32; ++j) {
@@ -113,7 +292,6 @@ index f66127c22..026f14de1 100644
 +            rotated[j] = tq3_centroids_dot[idx] * d;
 +        }
 +
-+        // Inline WHT butterfly (inverse == forward without signs)
 +        for (int step = 1; step < 32; step <<= 1) {
 +            for (int ii = 0; ii < 32; ii += step * 2) {
 +                for (int j = ii; j < ii + step; ++j) {
@@ -125,7 +303,6 @@ index f66127c22..026f14de1 100644
 +            }
 +        }
 +
-+        // Fused dot: inv_sqrt_32 × signs × d8 folded into one scale
 +        const float scale = 0.17677669529663688f * d8;
 +        float sumi = 0.0f;
 +        for (int j = 0; j < 32; ++j) {
@@ -134,6 +311,7 @@ index f66127c22..026f14de1 100644
 +        sumf += sumi * scale;
 +    }
 +    *s = sumf;
++#endif
 +}
 +
  //===================================== Q8_K ==============================================
@@ -153,10 +331,21 @@ index d4bc87a1c..4a12cdca6 100644
  void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
  void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 15443aa55..066ee21e5 100644
+index 15443aa55..71674294e 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
-@@ -2349,6 +2349,123 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+@@ -13,6 +13,10 @@
+ #include <stdlib.h> // for qsort
+ #include <stdio.h>  // for GGML_ASSERT
+ 
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
++
+ #define GROUP_MAX_EPS 1e-15f
+ #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
+ #define GROUP_MAX_EPS_IQ2_S 1e-8f
+@@ -2349,6 +2353,262 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
      return nrow * row_size;
  }
  
@@ -255,6 +444,144 @@ index 15443aa55..066ee21e5 100644
 +    assert(k % QK_TQ3_0 == 0);
 +    const int64_t nb = k / QK_TQ3_0;
 +
++#if defined(__ARM_NEON)
++    static const int8_t tq3_signs_i8_dq[32] = {
++        1,-1, 1, 1,-1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,
++        1,-1,-1, 1, 1,-1, 1,-1,-1, 1, 1, 1,-1,-1, 1,-1
++    };
++
++    for (int64_t i = 0; i < nb; ++i) {
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++
++        uint32_t w0, w1, w2;
++        memcpy(&w0, x[i].qs + 0, 4);
++        memcpy(&w1, x[i].qs + 4, 4);
++        memcpy(&w2, x[i].qs + 8, 4);
++
++        float r[32];
++        r[0]  = tq3_centroids[ w0        & 7];
++        r[1]  = tq3_centroids[(w0 >>  3) & 7];
++        r[2]  = tq3_centroids[(w0 >>  6) & 7];
++        r[3]  = tq3_centroids[(w0 >>  9) & 7];
++        r[4]  = tq3_centroids[(w0 >> 12) & 7];
++        r[5]  = tq3_centroids[(w0 >> 15) & 7];
++        r[6]  = tq3_centroids[(w0 >> 18) & 7];
++        r[7]  = tq3_centroids[(w0 >> 21) & 7];
++        r[8]  = tq3_centroids[(w0 >> 24) & 7];
++        r[9]  = tq3_centroids[(w0 >> 27) & 7];
++        r[10] = tq3_centroids[((w0 >> 30) | ((w1 & 1) << 2)) & 7];
++        r[11] = tq3_centroids[(w1 >>  1) & 7];
++        r[12] = tq3_centroids[(w1 >>  4) & 7];
++        r[13] = tq3_centroids[(w1 >>  7) & 7];
++        r[14] = tq3_centroids[(w1 >> 10) & 7];
++        r[15] = tq3_centroids[(w1 >> 13) & 7];
++        r[16] = tq3_centroids[(w1 >> 16) & 7];
++        r[17] = tq3_centroids[(w1 >> 19) & 7];
++        r[18] = tq3_centroids[(w1 >> 22) & 7];
++        r[19] = tq3_centroids[(w1 >> 25) & 7];
++        r[20] = tq3_centroids[(w1 >> 28) & 7];
++        r[21] = tq3_centroids[((w1 >> 31) | ((w2 & 3) << 1)) & 7];
++        r[22] = tq3_centroids[(w2 >>  2) & 7];
++        r[23] = tq3_centroids[(w2 >>  5) & 7];
++        r[24] = tq3_centroids[(w2 >>  8) & 7];
++        r[25] = tq3_centroids[(w2 >> 11) & 7];
++        r[26] = tq3_centroids[(w2 >> 14) & 7];
++        r[27] = tq3_centroids[(w2 >> 17) & 7];
++        r[28] = tq3_centroids[(w2 >> 20) & 7];
++        r[29] = tq3_centroids[(w2 >> 23) & 7];
++        r[30] = tq3_centroids[(w2 >> 26) & 7];
++        r[31] = tq3_centroids[(w2 >> 29) & 7];
++
++        float32x4_t a0 = vld1q_f32(r +  0);
++        float32x4_t a1 = vld1q_f32(r +  4);
++        float32x4_t a2 = vld1q_f32(r +  8);
++        float32x4_t a3 = vld1q_f32(r + 12);
++        float32x4_t a4 = vld1q_f32(r + 16);
++        float32x4_t a5 = vld1q_f32(r + 20);
++        float32x4_t a6 = vld1q_f32(r + 24);
++        float32x4_t a7 = vld1q_f32(r + 28);
++
++        // WHT inverse butterfly (same butterfly, post-process with signs + inv_sqrt_32*d)
++        #define WHT_STAGE1(va) { \
++            float32x4x2_t t = vuzpq_f32(va, va); \
++            float32x4_t e = t.val[0]; \
++            float32x4_t o = t.val[1]; \
++            float32x4_t sum = vaddq_f32(e, o); \
++            float32x4_t dif = vsubq_f32(e, o); \
++            float32x4x2_t zp = vzipq_f32(sum, dif); \
++            va = zp.val[0]; \
++        }
++        WHT_STAGE1(a0); WHT_STAGE1(a1); WHT_STAGE1(a2); WHT_STAGE1(a3);
++        WHT_STAGE1(a4); WHT_STAGE1(a5); WHT_STAGE1(a6); WHT_STAGE1(a7);
++        #undef WHT_STAGE1
++
++        #define WHT_STAGE2(va) { \
++            float32x2_t lo = vget_low_f32(va); \
++            float32x2_t hi = vget_high_f32(va); \
++            float32x2_t s2 = vadd_f32(lo, hi); \
++            float32x2_t d2 = vsub_f32(lo, hi); \
++            va = vcombine_f32(s2, d2); \
++        }
++        WHT_STAGE2(a0); WHT_STAGE2(a1); WHT_STAGE2(a2); WHT_STAGE2(a3);
++        WHT_STAGE2(a4); WHT_STAGE2(a5); WHT_STAGE2(a6); WHT_STAGE2(a7);
++        #undef WHT_STAGE2
++
++        float32x4_t b0 = vaddq_f32(a0, a1);
++        float32x4_t b1 = vaddq_f32(a2, a3);
++        float32x4_t b2 = vaddq_f32(a4, a5);
++        float32x4_t b3 = vaddq_f32(a6, a7);
++        float32x4_t b4 = vsubq_f32(a0, a1);
++        float32x4_t b5 = vsubq_f32(a2, a3);
++        float32x4_t b6 = vsubq_f32(a4, a5);
++        float32x4_t b7 = vsubq_f32(a6, a7);
++
++        float32x4_t c0 = vaddq_f32(b0, b1);
++        float32x4_t c1 = vaddq_f32(b2, b3);
++        float32x4_t c2 = vaddq_f32(b4, b5);
++        float32x4_t c3 = vaddq_f32(b6, b7);
++        float32x4_t c4 = vsubq_f32(b0, b1);
++        float32x4_t c5 = vsubq_f32(b2, b3);
++        float32x4_t c6 = vsubq_f32(b4, b5);
++        float32x4_t c7 = vsubq_f32(b6, b7);
++
++        float32x4_t e0 = vaddq_f32(c0, c1);
++        float32x4_t e1 = vaddq_f32(c2, c3);
++        float32x4_t e2 = vaddq_f32(c4, c5);
++        float32x4_t e3 = vaddq_f32(c6, c7);
++        float32x4_t e4 = vsubq_f32(c0, c1);
++        float32x4_t e5 = vsubq_f32(c2, c3);
++        float32x4_t e6 = vsubq_f32(c4, c5);
++        float32x4_t e7 = vsubq_f32(c6, c7);
++
++        // Signs: widen int8→float32 quickly
++        int8x16_t sg0 = vld1q_s8(tq3_signs_i8_dq + 0);
++        int8x16_t sg1 = vld1q_s8(tq3_signs_i8_dq + 16);
++        int16x8_t sg0_lo = vmovl_s8(vget_low_s8(sg0));
++        int16x8_t sg0_hi = vmovl_s8(vget_high_s8(sg0));
++        int16x8_t sg1_lo = vmovl_s8(vget_low_s8(sg1));
++        int16x8_t sg1_hi = vmovl_s8(vget_high_s8(sg1));
++        float32x4_t sf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16 (sg0_lo)));
++        float32x4_t sf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(sg0_lo)));
++        float32x4_t sf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16 (sg0_hi)));
++        float32x4_t sf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(sg0_hi)));
++        float32x4_t sf4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16 (sg1_lo)));
++        float32x4_t sf5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(sg1_lo)));
++        float32x4_t sf6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16 (sg1_hi)));
++        float32x4_t sf7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(sg1_hi)));
++
++        const float scale = 0.17677669529663688f * d;
++        float32x4_t scv = vdupq_n_f32(scale);
++
++        vst1q_f32(y + i*32 +  0, vmulq_f32(vmulq_f32(e0, sf0), scv));
++        vst1q_f32(y + i*32 +  4, vmulq_f32(vmulq_f32(e1, sf1), scv));
++        vst1q_f32(y + i*32 +  8, vmulq_f32(vmulq_f32(e2, sf2), scv));
++        vst1q_f32(y + i*32 + 12, vmulq_f32(vmulq_f32(e3, sf3), scv));
++        vst1q_f32(y + i*32 + 16, vmulq_f32(vmulq_f32(e4, sf4), scv));
++        vst1q_f32(y + i*32 + 20, vmulq_f32(vmulq_f32(e5, sf5), scv));
++        vst1q_f32(y + i*32 + 24, vmulq_f32(vmulq_f32(e6, sf6), scv));
++        vst1q_f32(y + i*32 + 28, vmulq_f32(vmulq_f32(e7, sf7), scv));
++    }
++#else
 +    for (int64_t i = 0; i < nb; ++i) {
 +        float rotated[QK_TQ3_0];
 +        const float d = GGML_FP16_TO_FP32(x[i].d);
@@ -275,6 +602,7 @@ index 15443aa55..066ee21e5 100644
 +            y[i*QK_TQ3_0 + j] = rotated[j];
 +        }
 +    }
++#endif
 +}
 +
  void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
