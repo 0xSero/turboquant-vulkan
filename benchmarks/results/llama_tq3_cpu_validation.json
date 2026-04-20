@@ -1,0 +1,19 @@
+{
+  "status": "working",
+  "integration": "llama.cpp CPU reference type",
+  "quant_type": "tq3_0",
+  "model": null,
+  "backend": "CPU",
+  "vram_used": null,
+  "uma_used": null,
+  "notes": [
+    "test-quantize-fns passed with tq3_0 included",
+    "test-quantize-perf accepted tq3_0 selection and executed successfully",
+    "No real model inference benchmark has been run yet, so model and memory fields remain null"
+  ],
+  "commands": {
+    "build": "cmake -S llama.cpp -B llama.cpp/build -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_COMMON=ON -DGGML_METAL=OFF && cmake --build llama.cpp/build --target test-quantize-fns test-quantize-perf -j4",
+    "test": "llama.cpp/build/bin/test-quantize-fns",
+    "perf": "llama.cpp/build/bin/test-quantize-perf --type tq3_0 --size 4096 --op quantize_row_q_reference --op dequantize_row_q -i 20"
+  }
+}
