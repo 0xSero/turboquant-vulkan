@@ -80,10 +80,10 @@ index 2b3eb5b5c..d9c45b4ea 100644
          .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
      },
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index f66127c22..40d25bc66 100644
+index f66127c22..2408438c7 100644
 --- a/ggml/src/ggml-cpu/quants.c
 +++ b/ggml/src/ggml-cpu/quants.c
-@@ -112,6 +112,620 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
+@@ -112,6 +112,653 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
      quantize_row_tq2_0_ref(x, y, k);
  }
  
@@ -637,7 +637,7 @@ index f66127c22..40d25bc66 100644
 +    -1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1, 1
 +};
 +
-+static void tq4_dot_wht32(float * x, const float * signs, bool inverse) {
++static inline void tq4_dot_wht32(float * x, const float * signs, bool inverse) {
 +    if (!inverse) {
 +        for (int i = 0; i < 32; ++i) x[i] *= signs[i];
 +    }
@@ -667,6 +667,21 @@ index f66127c22..40d25bc66 100644
 +    const block_q8_0  * GGML_RESTRICT y = vy;
 +
 +    const int64_t nb = n / QK_TQ4_0;
++    // WHT is orthonormal with 1/sqrt(32) factor; since we apply it to y,
++    // reconstructing x_hat and dotting with y is equivalent to dotting
++    // x_hat_rotated with y_rotated. Math-identity trick:
++    //   <x_hat, y> = <d·c_q + d·dj·√(π/2)·WHT_B⁻¹(sign_p), WHT_A⁻¹(y_rot_A)>
++    //              = <d·c_q, y_rot_A> + d·dj·√(π/2)·<sign_p, WHT_B(y_rot_A)·signs_B>
++    // where y_rot_A = WHT_A(y_scaled·signs_A⁻¹·signs_A) · (factors absorb via signs).
++    // We operate entirely on the y_rotated side (1 block), keeping x in raw form.
++    //
++    // Layout of fused dot per block:
++    //   1. Load q8 y values (int8) → float, multiply by d8
++    //   2. Apply WHT-A to get y_rot
++    //   3. Main term: sum_j c_q[j] * y_rot[j]  → multiply by d
++    //   4. Apply WHT-B to y_rot (additional rotation on top) → y_rot_B
++    //   5. Residual term: sum_j sign_p[j] * signs_B[j] * y_rot_B[j] → multiply by d·dj·√(π/2)
++    //   6. sum of 2 terms
 +    const float sqrt_pi_over_2 = 1.2533141373155001f;
 +
 +    float sumf = 0.0f;
@@ -675,28 +690,46 @@ index f66127c22..40d25bc66 100644
 +        const float dj = GGML_FP16_TO_FP32(x[i].dj);
 +        const float d8 = GGML_FP16_TO_FP32(y[i].d);
 +
-+        // Reconstruct full x_hat in rotated basis, then WHT-A inverse
-+        float r[32];
++        // Math-identity derivation:
++        //   Let H = normalized symmetric Hadamard ((1/√32)·H_raw), D_A = diag(signs_A), both symmetric.
++        //   Reference dequant uses WHT_A_inverse on r̂ to get x̂:
++        //     x̂ = WHT_A_inv(r̂) = D_A · H · r̂
++        //   So <x̂, y> = (D_A·H·r̂)^T · y = r̂^T · H^T · D_A^T · y = r̂^T · H · D_A · y = <r̂, WHT_A_forward(y, signs_A)>
++        //   (H·D_A·y is the FORWARD transform: signs applied first, then butterfly, then normalize.)
++        // So we apply WHT-A FORWARD to y.
++        float y_rot[32] __attribute__((aligned(32)));
++        for (int j = 0; j < 32; ++j) {
++            y_rot[j] = (float)y[i].qs[j] * d8;
++        }
++        tq4_dot_wht32(y_rot, tq4_dot_signs_A, false);
++
++        // Main term: <d·c_q, y_rot>
++        float sum_main = 0.0f;
 +        for (int j = 0; j < 32; j += 2) {
 +            const uint8_t packed = x[i].qs[j/2];
-+            r[j]   = d * tq4_dot_centroids[packed & 0x0F];
-+            r[j+1] = d * tq4_dot_centroids[(packed >> 4) & 0x0F];
++            sum_main += tq4_dot_centroids[packed & 0x0F] * y_rot[j];
++            sum_main += tq4_dot_centroids[(packed >> 4) & 0x0F] * y_rot[j+1];
 +        }
-+        float rr[32];
-+        for (int j = 0; j < 32; ++j) {
-+            const int bit = (x[i].qjl[j >> 3] >> (j & 7)) & 1;
-+            rr[j] = bit ? 1.0f : -1.0f;
-+        }
-+        tq4_dot_wht32(rr, tq4_dot_signs_B, true);
-+        const float res_scale = d * dj * sqrt_pi_over_2;
-+        for (int j = 0; j < 32; ++j) r[j] += res_scale * rr[j];
-+        tq4_dot_wht32(r, tq4_dot_signs_A, true);
 +
-+        float sumi = 0.0f;
++        // Residual term: <sign_p, WHT_B_forward_unsigned_normalized(y_rot ⊙ signs_B)>
++        //   ê = d·dj·√(π/2) · WHT_B⁻¹(sign_p) = d·dj·√(π/2) · D_B · H · sign_p
++        //   <ê, r_rotated> where r_rotated was d·c_q + ê_term, we want <ê_term, y_rot>
++        //   <D_B·H·sign_p, y_rot> = <sign_p, H^T·D_B^T·y_rot> = <sign_p, H·D_B·y_rot> = <sign_p, WHT_B_forward(y_rot, signs_B)>
++        float yr_B[32] __attribute__((aligned(32)));
++        memcpy(yr_B, y_rot, sizeof(yr_B));
++        tq4_dot_wht32(yr_B, tq4_dot_signs_B, false);
++
++        const uint32_t sign_bits = ((uint32_t)x[i].qjl[0])
++                                 | ((uint32_t)x[i].qjl[1] << 8)
++                                 | ((uint32_t)x[i].qjl[2] << 16)
++                                 | ((uint32_t)x[i].qjl[3] << 24);
++        float sum_res = 0.0f;
 +        for (int j = 0; j < 32; ++j) {
-+            sumi += r[j] * (float)y[i].qs[j];
++            const float sp = ((sign_bits >> j) & 1) ? 1.0f : -1.0f;
++            sum_res += sp * yr_B[j];
 +        }
-+        sumf += sumi * d8;
++
++        sumf += d * sum_main + d * dj * sqrt_pi_over_2 * sum_res;
 +    }
 +    *s = sumf;
 +}
@@ -721,7 +754,7 @@ index d4bc87a1c..be52be51e 100644
  void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
  void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 15443aa55..a25eeb4c9 100644
+index 15443aa55..a99fc115d 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
 @@ -13,6 +13,13 @@
@@ -738,7 +771,7 @@ index 15443aa55..a25eeb4c9 100644
  #define GROUP_MAX_EPS 1e-15f
  #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
  #define GROUP_MAX_EPS_IQ2_S 1e-8f
-@@ -2349,6 +2356,552 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+@@ -2349,6 +2356,553 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
      return nrow * row_size;
  }
  
@@ -1140,7 +1173,7 @@ index 15443aa55..a25eeb4c9 100644
 +static const float tq4_centroid_rms = 1.3400f; // sqrt of centroid variance weighted by Gaussian PMF
 +
 +// Same Hadamard structure as tq3_wht32 but with configurable sign array.
-+static void tq4_wht32(float * x, const float * signs, bool inverse) {
++static inline void tq4_wht32(float * x, const float * signs, bool inverse) {
 +    if (!inverse) {
 +        for (int i = 0; i < 32; ++i) x[i] *= signs[i];
 +    }
@@ -1259,20 +1292,21 @@ index 15443aa55..a25eeb4c9 100644
 +        const float dj = GGML_FP16_TO_FP32(x[i].dj);
 +
 +        // Reconstruct main centroid values: r_main[j] = d * c_{q_j}
-+        float r[QK_TQ4_0];
++        float r[QK_TQ4_0] __attribute__((aligned(32)));
 +        for (int j = 0; j < QK_TQ4_0; j += 2) {
 +            const uint8_t packed = x[i].qs[j/2];
 +            r[j]   = d * tq4_centroids[packed & 0x0F];
 +            r[j+1] = d * tq4_centroids[(packed >> 4) & 0x0F];
 +        }
 +
-+        // Reconstruct residual estimate: sign bits → ±1, then WHT-B inverse,
-+        // scaled by d*dj*sqrt(pi/2). The d factor comes from the fact that
-+        // e was in the d-normalized space.
-+        float rr[QK_TQ4_0];
++        // Reconstruct residual estimate: sign bits → ±1, then WHT-B inverse
++        float rr[QK_TQ4_0] __attribute__((aligned(32)));
++        const uint32_t sign_bits = ((uint32_t)x[i].qjl[0])
++                                 | ((uint32_t)x[i].qjl[1] << 8)
++                                 | ((uint32_t)x[i].qjl[2] << 16)
++                                 | ((uint32_t)x[i].qjl[3] << 24);
 +        for (int j = 0; j < QK_TQ4_0; ++j) {
-+            const int bit = (x[i].qjl[j >> 3] >> (j & 7)) & 1;
-+            rr[j] = bit ? 1.0f : -1.0f;
++            rr[j] = ((sign_bits >> j) & 1) ? 1.0f : -1.0f;
 +        }
 +        tq4_wht32(rr, tq4_signs_B, true);
 +        const float res_scale = d * dj * sqrt_pi_over_2;
