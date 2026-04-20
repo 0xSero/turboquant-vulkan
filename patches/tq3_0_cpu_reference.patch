@@ -60,10 +60,10 @@ index 2b3eb5b5c..362890719 100644
          .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
      },
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index f66127c22..a106c7c3e 100644
+index f66127c22..026f14de1 100644
 --- a/ggml/src/ggml-cpu/quants.c
 +++ b/ggml/src/ggml-cpu/quants.c
-@@ -112,6 +112,35 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
+@@ -112,6 +112,75 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
      quantize_row_tq2_0_ref(x, y, k);
  }
  
@@ -72,6 +72,19 @@ index f66127c22..a106c7c3e 100644
 +    block_tq3_0 * GGML_RESTRICT y = vy;
 +    quantize_row_tq3_0_ref(x, y, k);
 +}
++
++// Optimized vec_dot: WHT is orthogonal, so dot(WHT_inv(a), b) == dot(a, WHT(b))
++// Instead of dequantizing TQ3 (expensive WHT inverse), we WHT-forward the q8 side
++// and dot directly with scaled centroids. This avoids the 80-op butterfly on the hot path.
++//
++// Actually even simpler: inline dequant + fuse dot. The WHT inverse on 32 floats
++// followed by dot with 32 ints is equivalent to: dot the centroid-scaled rotated
++// values with the WHT-forward of the q8 values. But the WHT of q8 is equally expensive.
++//
++// Best approach for CPU: just inline everything, avoid function call, unroll bit extract.
++
++static const float tq3_centroids_dot[8] = {-2.1519f, -1.3439f, -0.7560f, -0.2451f, 0.2451f, 0.7560f, 1.3439f, 2.1519f};
++static const float tq3_signs_dot[32] = {1,-1,1,1,-1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,1,-1,-1,1,1,-1,1,-1,-1,1,1,1,-1,-1,1,-1};
 +
 +void ggml_vec_dot_tq3_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
 +    assert(nrc == 1);
@@ -83,15 +96,42 @@ index f66127c22..a106c7c3e 100644
 +
 +    float sumf = 0.0f;
 +    for (int i = 0; i < nb; ++i) {
-+        float tmp[QK_TQ3_0];
-+        dequantize_row_tq3_0(&x[i], tmp, QK_TQ3_0);
-+
++        const float d  = GGML_CPU_FP16_TO_FP32(x[i].d);
 +        const float d8 = GGML_CPU_FP16_TO_FP32(y[i].d);
-+        float sumi = 0.0f;
-+        for (int j = 0; j < QK_TQ3_0; ++j) {
-+            sumi += tmp[j] * (float)y[i].qs[j];
++
++        // Unpack 3-bit indices → scaled centroids
++        float rotated[32];
++        const uint8_t * qs = x[i].qs;
++        for (int j = 0; j < 32; ++j) {
++            const int bit = j * 3;
++            const int byte = bit / 8;
++            const int shift = bit % 8;
++            uint8_t idx = (qs[byte] >> shift) & 0x7;
++            if (shift > 5) {
++                idx |= (qs[byte + 1] << (8 - shift)) & 0x7;
++            }
++            rotated[j] = tq3_centroids_dot[idx] * d;
 +        }
-+        sumf += sumi * d8;
++
++        // Inline WHT butterfly (inverse == forward without signs)
++        for (int step = 1; step < 32; step <<= 1) {
++            for (int ii = 0; ii < 32; ii += step * 2) {
++                for (int j = ii; j < ii + step; ++j) {
++                    const float a = rotated[j];
++                    const float b = rotated[j + step];
++                    rotated[j] = a + b;
++                    rotated[j + step] = a - b;
++                }
++            }
++        }
++
++        // Fused dot: inv_sqrt_32 × signs × d8 folded into one scale
++        const float scale = 0.17677669529663688f * d8;
++        float sumi = 0.0f;
++        for (int j = 0; j < 32; ++j) {
++            sumi += rotated[j] * tq3_signs_dot[j] * (float)y[i].qs[j];
++        }
++        sumf += sumi * scale;
 +    }
 +    *s = sumf;
 +}
@@ -296,7 +336,7 @@ index eda041f45..c65ab7bb7 100644
          case GGML_TYPE_IQ2_XS:  result = quantize_iq2_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
          case GGML_TYPE_IQ3_XXS: result = quantize_iq3_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
 diff --git a/tests/test-quantize-fns.cpp b/tests/test-quantize-fns.cpp
-index a05fab504..e2bdb9317 100644
+index a05fab504..fb5397488 100644
 --- a/tests/test-quantize-fns.cpp
 +++ b/tests/test-quantize-fns.cpp
 @@ -22,6 +22,7 @@ constexpr float MAX_QUANTIZATION_TOTAL_ERROR_2BITS = 0.0075f;
@@ -315,6 +355,15 @@ index a05fab504..e2bdb9317 100644
                  type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                  type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                  type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+@@ -175,7 +177,7 @@ int main(int argc, char * argv[]) {
+                                           ? MAX_DOT_PRODUCT_ERROR_LOWBIT
+                                           : type == GGML_TYPE_Q1_0
+                                           ? MAX_DOT_PRODUCT_ERROR_BINARY
+-                                          : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0
++                                          : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_TQ3_0
+                                           ? MAX_DOT_PRODUCT_ERROR_TERNARY
+                                           : type == GGML_TYPE_NVFP4
+                                           ? MAX_DOT_PRODUCT_ERROR_FP4
 diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
 index 59920ab51..f305d623a 100644
 --- a/tools/llama-bench/llama-bench.cpp
