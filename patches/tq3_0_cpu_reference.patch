@@ -609,21 +609,24 @@ index d4bc87a1c..4a12cdca6 100644
  void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
  void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 15443aa55..db7ca47b1 100644
+index 15443aa55..807716c26 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
-@@ -13,6 +13,10 @@
+@@ -13,6 +13,13 @@
  #include <stdlib.h> // for qsort
  #include <stdio.h>  // for GGML_ASSERT
  
 +#if defined(__ARM_NEON)
 +#include <arm_neon.h>
 +#endif
++#if defined(__AVX2__)
++#include <immintrin.h>
++#endif
 +
  #define GROUP_MAX_EPS 1e-15f
  #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
  #define GROUP_MAX_EPS_IQ2_S 1e-8f
-@@ -2349,6 +2353,300 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+@@ -2349,6 +2356,380 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
      return nrow * row_size;
  }
  
@@ -722,8 +725,6 @@ index 15443aa55..db7ca47b1 100644
 +        }
 +    }
 +
-+    // Per-row scale: same centroid-compatible magnitude as before,
-+    // but computed over all nb*32 values instead of just 32.
 +    float d = sqrtf(row_sumsq / (nb * QK_TQ3_0)) / tq3_centroid_rms;
 +    if (d <= 0.0f) d = 1e-8f;
 +    const float id = 1.0f / d;
@@ -896,6 +897,88 @@ index 15443aa55..db7ca47b1 100644
 +        vst1q_f32(y + i*32 + 20, vmulq_f32(vmulq_f32(e5, sf5), scv));
 +        vst1q_f32(y + i*32 + 24, vmulq_f32(vmulq_f32(e6, sf6), scv));
 +        vst1q_f32(y + i*32 + 28, vmulq_f32(vmulq_f32(e7, sf7), scv));
++    }
++#elif defined(__AVX2__)
++    // AVX2 dequant: unpack centroids + scalar butterfly (auto-vectorized by compiler)
++    // + AVX2 multiplication by signs*inv_sqrt_32*d to write output.
++    static const float tq3_signs_f32[32] __attribute__((aligned(32))) = {
++         1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f,
++         1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f,
++         1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f,
++        -1.0f, 1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f
++    };
++
++    for (int64_t i = 0; i < nb; ++i) {
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++
++        uint32_t w0, w1, w2;
++        memcpy(&w0, x[i].qs + 0, 4);
++        memcpy(&w1, x[i].qs + 4, 4);
++        memcpy(&w2, x[i].qs + 8, 4);
++
++        float r[32] __attribute__((aligned(32)));
++        r[0]  = tq3_centroids[ w0        & 7];
++        r[1]  = tq3_centroids[(w0 >>  3) & 7];
++        r[2]  = tq3_centroids[(w0 >>  6) & 7];
++        r[3]  = tq3_centroids[(w0 >>  9) & 7];
++        r[4]  = tq3_centroids[(w0 >> 12) & 7];
++        r[5]  = tq3_centroids[(w0 >> 15) & 7];
++        r[6]  = tq3_centroids[(w0 >> 18) & 7];
++        r[7]  = tq3_centroids[(w0 >> 21) & 7];
++        r[8]  = tq3_centroids[(w0 >> 24) & 7];
++        r[9]  = tq3_centroids[(w0 >> 27) & 7];
++        r[10] = tq3_centroids[((w0 >> 30) | ((w1 & 1) << 2)) & 7];
++        r[11] = tq3_centroids[(w1 >>  1) & 7];
++        r[12] = tq3_centroids[(w1 >>  4) & 7];
++        r[13] = tq3_centroids[(w1 >>  7) & 7];
++        r[14] = tq3_centroids[(w1 >> 10) & 7];
++        r[15] = tq3_centroids[(w1 >> 13) & 7];
++        r[16] = tq3_centroids[(w1 >> 16) & 7];
++        r[17] = tq3_centroids[(w1 >> 19) & 7];
++        r[18] = tq3_centroids[(w1 >> 22) & 7];
++        r[19] = tq3_centroids[(w1 >> 25) & 7];
++        r[20] = tq3_centroids[(w1 >> 28) & 7];
++        r[21] = tq3_centroids[((w1 >> 31) | ((w2 & 3) << 1)) & 7];
++        r[22] = tq3_centroids[(w2 >>  2) & 7];
++        r[23] = tq3_centroids[(w2 >>  5) & 7];
++        r[24] = tq3_centroids[(w2 >>  8) & 7];
++        r[25] = tq3_centroids[(w2 >> 11) & 7];
++        r[26] = tq3_centroids[(w2 >> 14) & 7];
++        r[27] = tq3_centroids[(w2 >> 17) & 7];
++        r[28] = tq3_centroids[(w2 >> 20) & 7];
++        r[29] = tq3_centroids[(w2 >> 23) & 7];
++        r[30] = tq3_centroids[(w2 >> 26) & 7];
++        r[31] = tq3_centroids[(w2 >> 29) & 7];
++
++        // Butterfly (scalar — compiler auto-vectorizes the add/sub pairs)
++        for (int step = 1; step < 32; step <<= 1) {
++            for (int ii = 0; ii < 32; ii += step * 2) {
++                for (int j = ii; j < ii + step; ++j) {
++                    const float a = r[j];
++                    const float b = r[j + step];
++                    r[j] = a + b;
++                    r[j + step] = a - b;
++                }
++            }
++        }
++
++        // Vectorized signs + scale + store
++        const float scale = 0.17677669529663688f * d;
++        const __m256 scv = _mm256_set1_ps(scale);
++
++        const __m256 r0 = _mm256_load_ps(r +  0);
++        const __m256 r1 = _mm256_load_ps(r +  8);
++        const __m256 r2 = _mm256_load_ps(r + 16);
++        const __m256 r3 = _mm256_load_ps(r + 24);
++        const __m256 s0 = _mm256_load_ps(tq3_signs_f32 +  0);
++        const __m256 s1 = _mm256_load_ps(tq3_signs_f32 +  8);
++        const __m256 s2 = _mm256_load_ps(tq3_signs_f32 + 16);
++        const __m256 s3 = _mm256_load_ps(tq3_signs_f32 + 24);
++
++        _mm256_storeu_ps(y + i*32 +  0, _mm256_mul_ps(_mm256_mul_ps(r0, s0), scv));
++        _mm256_storeu_ps(y + i*32 +  8, _mm256_mul_ps(_mm256_mul_ps(r1, s1), scv));
++        _mm256_storeu_ps(y + i*32 + 16, _mm256_mul_ps(_mm256_mul_ps(r2, s2), scv));
++        _mm256_storeu_ps(y + i*32 + 24, _mm256_mul_ps(_mm256_mul_ps(r3, s3), scv));
 +    }
 +#else
 +    for (int64_t i = 0; i < nb; ++i) {
