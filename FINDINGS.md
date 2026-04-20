@@ -18,7 +18,7 @@ makes inner products unbiased. Accuracy matches the paper's "quality-neutral" cl
 | KV cache      | PPL             | Gap vs f16 |
 |---------------|-----------------|------------|
 | f16 / f16     | 7.6540 ± 0.11   | baseline   |
-| **tq4_0 / tq4_0** | **7.7076 ± 0.11** | **+0.70%** ✓ |
+| **tq4_0 / tq4_0** | **7.6798 ± 0.11** | **+0.34%** ✓ |
 | tq3_0 / tq3_0 | 8.0811 ± 0.11   | +5.58%     |
 
 **TQ4_0 + QJL is within 1% of f16** — the paper's "absolute quality neutrality" threshold.
