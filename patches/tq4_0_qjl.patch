@@ -80,10 +80,10 @@ index 2b3eb5b5c..d9c45b4ea 100644
          .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
      },
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index f66127c22..2408438c7 100644
+index f66127c22..6c9602135 100644
 --- a/ggml/src/ggml-cpu/quants.c
 +++ b/ggml/src/ggml-cpu/quants.c
-@@ -112,6 +112,653 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
+@@ -112,6 +112,659 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
      quantize_row_tq2_0_ref(x, y, k);
  }
  
@@ -723,10 +723,16 @@ index f66127c22..2408438c7 100644
 +                                 | ((uint32_t)x[i].qjl[1] << 8)
 +                                 | ((uint32_t)x[i].qjl[2] << 16)
 +                                 | ((uint32_t)x[i].qjl[3] << 24);
++        // Branchless: flip sign bit of yr_B[j] when sign_p bit is 0 (so +1 contributes yr_B, -1 contributes -yr_B).
 +        float sum_res = 0.0f;
 +        for (int j = 0; j < 32; ++j) {
-+            const float sp = ((sign_bits >> j) & 1) ? 1.0f : -1.0f;
-+            sum_res += sp * yr_B[j];
++            uint32_t bits;
++            memcpy(&bits, &yr_B[j], 4);
++            const uint32_t flip = (1u ^ ((sign_bits >> j) & 1u)) << 31;
++            bits ^= flip;
++            float v;
++            memcpy(&v, &bits, 4);
++            sum_res += v;
 +        }
 +
 +        sumf += d * sum_main + d * dj * sqrt_pi_over_2 * sum_res;
@@ -754,7 +760,7 @@ index d4bc87a1c..be52be51e 100644
  void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
  void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 15443aa55..a99fc115d 100644
+index 15443aa55..97e339652 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
 @@ -13,6 +13,13 @@
@@ -771,7 +777,7 @@ index 15443aa55..a99fc115d 100644
  #define GROUP_MAX_EPS 1e-15f
  #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
  #define GROUP_MAX_EPS_IQ2_S 1e-8f
-@@ -2349,6 +2356,553 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+@@ -2349,6 +2356,556 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
      return nrow * row_size;
  }
  
@@ -1280,18 +1286,21 @@ index 15443aa55..a99fc115d 100644
 +    assert(k % QK_TQ4_0 == 0);
 +    const int64_t nb = k / QK_TQ4_0;
 +
-+    // QJL residual reconstruction constant:
-+    // E[sign(p_i) * <sign, e_true>] gives an unbiased estimator with scale
-+    // factor sqrt(2/pi) · sigma, where sigma = dj. After WHT-B inverse, the
-+    // residual contribution per coordinate = dj * sqrt(pi/2) · R^T @ sign(p)
-+    // We apply the scalar after the butterfly.
-+    const float sqrt_pi_over_2 = 1.2533141373155001f; // sqrt(pi/2)
++    // QJL residual reconstruction constant: factor sqrt(pi/2) · dj.
++    // After WHT-B inverse: residual per coord = dj * sqrt(pi/2) * (D_B · H · sign_p)
++    const float sqrt_pi_over_2 = 1.2533141373155001f;
 +
 +    for (int64_t i = 0; i < nb; ++i) {
 +        const float d = GGML_FP16_TO_FP32(x[i].d);
 +        const float dj = GGML_FP16_TO_FP32(x[i].dj);
 +
-+        // Reconstruct main centroid values: r_main[j] = d * c_{q_j}
++        // Precompute combined sign-bits for QJL (4 bytes → 32 bits)
++        const uint32_t sign_bits = ((uint32_t)x[i].qjl[0])
++                                 | ((uint32_t)x[i].qjl[1] << 8)
++                                 | ((uint32_t)x[i].qjl[2] << 16)
++                                 | ((uint32_t)x[i].qjl[3] << 24);
++
++        // Centroid lookup: 4-bit indices → centroid values. Multiply by d here.
 +        float r[QK_TQ4_0] __attribute__((aligned(32)));
 +        for (int j = 0; j < QK_TQ4_0; j += 2) {
 +            const uint8_t packed = x[i].qs[j/2];
@@ -1299,26 +1308,26 @@ index 15443aa55..a99fc115d 100644
 +            r[j+1] = d * tq4_centroids[(packed >> 4) & 0x0F];
 +        }
 +
-+        // Reconstruct residual estimate: sign bits → ±1, then WHT-B inverse
++        // Build res_scale * sign_p vector (±res_scale) via bit-twiddle.
++        // This pre-scales the residual so that post-WHT-B no extra loop needed.
++        const float res_scale = d * dj * sqrt_pi_over_2;
++        const uint32_t rs_bits_pos = *(const uint32_t*)&res_scale;
++        const uint32_t rs_bits_neg = rs_bits_pos ^ 0x80000000u;
 +        float rr[QK_TQ4_0] __attribute__((aligned(32)));
-+        const uint32_t sign_bits = ((uint32_t)x[i].qjl[0])
-+                                 | ((uint32_t)x[i].qjl[1] << 8)
-+                                 | ((uint32_t)x[i].qjl[2] << 16)
-+                                 | ((uint32_t)x[i].qjl[3] << 24);
 +        for (int j = 0; j < QK_TQ4_0; ++j) {
-+            rr[j] = ((sign_bits >> j) & 1) ? 1.0f : -1.0f;
++            const uint32_t fbits = ((sign_bits >> j) & 1u) ? rs_bits_pos : rs_bits_neg;
++            memcpy(&rr[j], &fbits, sizeof(float));
 +        }
 +        tq4_wht32(rr, tq4_signs_B, true);
-+        const float res_scale = d * dj * sqrt_pi_over_2;
++
++        // Add residual to main reconstruction (simple vectorizable loop).
 +        for (int j = 0; j < QK_TQ4_0; ++j) {
-+            r[j] += res_scale * rr[j];
++            r[j] += rr[j];
 +        }
 +
-+        // Apply WHT-A inverse to go back to original space
++        // Apply WHT-A inverse to go back to original space, store directly to y.
 +        tq4_wht32(r, tq4_signs_A, true);
-+        for (int j = 0; j < QK_TQ4_0; ++j) {
-+            y[i*QK_TQ4_0 + j] = r[j];
-+        }
++        memcpy(y + i*QK_TQ4_0, r, QK_TQ4_0 * sizeof(float));
 +    }
 +}
 +
